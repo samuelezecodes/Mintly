@@ -1,4 +1,4 @@
-;; Mintly Token Contract
+;; Mintly Token Contract - Enhanced Security Version
 ;; A fungible token implementation with governance and advanced features
 
 ;; Define token
@@ -9,6 +9,9 @@
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-INSUFFICIENT-BALANCE (err u101))
 (define-constant ERR-INVALID-AMOUNT (err u102))
+(define-constant ERR-INVALID-RECIPIENT (err u103))
+(define-constant ERR-INVALID-SPENDER (err u104))
+(define-constant ERR-OVERFLOW (err u105))
 
 ;; Data maps
 (define-map allowances 
@@ -23,6 +26,21 @@
 (define-map governance-tokens
     { holder: principal }
     { voting-power: uint })
+
+;; Private functions for safety checks
+(define-private (is-valid-recipient (recipient principal))
+    (and 
+        (not (is-eq recipient (as-contract tx-sender)))
+        (not (is-eq recipient contract-owner))))
+
+(define-private (check-and-get-balance (account principal))
+    (default-to u0 (get voting-power (map-get? governance-tokens { holder: account }))))
+
+(define-private (safe-add (a uint) (b uint))
+    (let ((sum (+ a b)))
+        (if (>= sum a)
+            sum
+            u0)))  ;; Return 0 if overflow detected
 
 ;; Read-only functions
 (define-read-only (get-name)
@@ -47,84 +65,89 @@
     (begin
         (asserts! (is-eq tx-sender contract-owner) ERR-NOT-AUTHORIZED)
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-        (try! (ft-mint? mintly amount recipient))
-        ;; Update voting power for governance
-        (map-set governance-tokens
-            { holder: recipient }
-            { voting-power: (+ (unwrap-panic (get-balance recipient)) amount) })
-        (ok true)))
+        (asserts! (is-valid-recipient recipient) ERR-INVALID-RECIPIENT)
+        
+        (let ((current-balance (unwrap! (get-balance recipient) ERR-INVALID-RECIPIENT))
+              (new-balance (safe-add current-balance amount)))
+            
+            (asserts! (> new-balance u0) ERR-OVERFLOW)
+            (try! (ft-mint? mintly amount recipient))
+            
+            (map-set governance-tokens
+                { holder: recipient }
+                { voting-power: new-balance })
+            (ok true))))
 
 (define-public (transfer (amount uint) (recipient principal))
     (begin
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-        (try! (ft-transfer? mintly amount tx-sender recipient))
-        ;; Update voting power for both parties
-        (map-set governance-tokens
-            { holder: tx-sender }
-            { voting-power: (- (unwrap-panic (get-balance tx-sender)) amount) })
-        (map-set governance-tokens
-            { holder: recipient }
-            { voting-power: (+ (unwrap-panic (get-balance recipient)) amount) })
-        (ok true)))
+        (asserts! (is-valid-recipient recipient) ERR-INVALID-RECIPIENT)
+        
+        (let ((sender-balance (unwrap! (get-balance tx-sender) ERR-INSUFFICIENT-BALANCE))
+              (recipient-balance (unwrap! (get-balance recipient) ERR-INVALID-RECIPIENT))
+              (new-recipient-balance (safe-add recipient-balance amount)))
+            
+            (asserts! (>= sender-balance amount) ERR-INSUFFICIENT-BALANCE)
+            (asserts! (> new-recipient-balance u0) ERR-OVERFLOW)
+            
+            (try! (ft-transfer? mintly amount tx-sender recipient))
+            
+            (map-set governance-tokens
+                { holder: tx-sender }
+                { voting-power: (- sender-balance amount) })
+            (map-set governance-tokens
+                { holder: recipient }
+                { voting-power: new-recipient-balance })
+            (ok true))))
 
 (define-public (approve (amount uint) (spender principal))
     (begin
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (not (is-eq spender tx-sender)) ERR-INVALID-SPENDER)
         (map-set allowances
             { owner: tx-sender, spender: spender }
             { amount: amount })
         (ok true)))
 
 (define-public (transfer-from (amount uint) (owner principal) (recipient principal))
-    (let ((current-allowance (unwrap! (get-allowance owner tx-sender) ERR-NOT-AUTHORIZED)))
-        (begin
+    (begin
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (is-valid-recipient recipient) ERR-INVALID-RECIPIENT)
+        
+        (let ((current-allowance (unwrap! (get-allowance owner tx-sender) ERR-NOT-AUTHORIZED))
+              (sender-balance (unwrap! (get-balance owner) ERR-INSUFFICIENT-BALANCE))
+              (recipient-balance (unwrap! (get-balance recipient) ERR-INVALID-RECIPIENT))
+              (new-recipient-balance (safe-add recipient-balance amount)))
+            
             (asserts! (>= current-allowance amount) ERR-INSUFFICIENT-BALANCE)
+            (asserts! (>= sender-balance amount) ERR-INSUFFICIENT-BALANCE)
+            (asserts! (> new-recipient-balance u0) ERR-OVERFLOW)
+            
             (try! (ft-transfer? mintly amount owner recipient))
-            ;; Update allowance
+            
             (map-set allowances
                 { owner: owner, spender: tx-sender }
                 { amount: (- current-allowance amount) })
-            ;; Update voting power
+            
             (map-set governance-tokens
                 { holder: owner }
-                { voting-power: (- (unwrap-panic (get-balance owner)) amount) })
+                { voting-power: (- sender-balance amount) })
             (map-set governance-tokens
                 { holder: recipient }
-                { voting-power: (+ (unwrap-panic (get-balance recipient)) amount) })
+                { voting-power: new-recipient-balance })
             (ok true))))
 
 (define-public (burn (amount uint))
     (begin
         (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-        (try! (ft-burn? mintly amount tx-sender))
-        ;; Update voting power
-        (map-set governance-tokens
-            { holder: tx-sender }
-            { voting-power: (- (unwrap-panic (get-balance tx-sender)) amount) })
-        (ok true)))
+        (let ((current-balance (unwrap! (get-balance tx-sender) ERR-INSUFFICIENT-BALANCE)))
+            (asserts! (>= current-balance amount) ERR-INSUFFICIENT-BALANCE)
+            (try! (ft-burn? mintly amount tx-sender))
+            (map-set governance-tokens
+                { holder: tx-sender }
+                { voting-power: (- current-balance amount) })
+            (ok true))))
 
 ;; Governance functions
-(define-public (get-voting-power (holder principal))
-    (match (map-get? governance-tokens { holder: holder })
-        power (ok (get voting-power power))
-        (ok u0)))
-
-;; Token freezing functions
-(define-public (freeze-tokens (amount uint))
-    (begin
-        (asserts! (>= (unwrap-panic (get-balance tx-sender)) amount) ERR-INSUFFICIENT-BALANCE)
-        (try! (ft-burn? mintly amount tx-sender))
-        (map-set frozen-tokens
-            { address: tx-sender }
-            { amount: (+ (default-to u0 (get amount (map-get? frozen-tokens { address: tx-sender }))) amount) })
-        (ok true)))
-
-(define-public (unfreeze-tokens (amount uint))
-    (let ((frozen-amount (default-to u0 (get amount (map-get? frozen-tokens { address: tx-sender })))))
-        (begin
-            (asserts! (>= frozen-amount amount) ERR-INSUFFICIENT-BALANCE)
-            (try! (ft-mint? mintly amount tx-sender))
-            (map-set frozen-tokens
-                { address: tx-sender }
-                { amount: (- frozen-amount amount) })
-            (ok true))))
+(define-read-only (get-voting-power (holder principal))
+    (ok (check-and-get-balance holder)))
