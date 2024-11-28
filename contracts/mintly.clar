@@ -121,11 +121,25 @@
         (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
         (asserts! (not (var-get initialized)) ERR-ALREADY-INITIALIZED)
         
+        ;; Validate name
+        (asserts! (>= (len name) u1) ERR-INVALID-AMOUNT)  ;; Ensure name is not empty
+        (asserts! (<= (len name) u32) ERR-INVALID-AMOUNT)  ;; Extra safety check for length
+        
+        ;; Validate symbol
+        (asserts! (>= (len symbol) u1) ERR-INVALID-AMOUNT)  ;; Ensure symbol is not empty
+        (asserts! (<= (len symbol) u10) ERR-INVALID-AMOUNT)  ;; Extra safety check for length
+        
+        ;; Validate decimals (common values are 6, 8, or 18)
+        (asserts! (<= decimals u18) ERR-INVALID-AMOUNT)  ;; Ensure decimals is reasonable
+        (asserts! (>= decimals u0) ERR-INVALID-AMOUNT)   ;; Ensure decimals is non-negative
+        
+        ;; After validation, set the values
         (var-set token-name name)
         (var-set token-symbol symbol)
         (var-set token-decimals decimals)
         (var-set initialized true)
         (ok true)))
+
 
 (define-public (set-contract-owner (new-owner principal))
     (begin
